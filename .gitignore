@@ -23,7 +23,7 @@ dist-ssr
 *.sln
 *.sw?
 
-.npm-cache/*
+.npm-cache/
 
 .env
 .env.*
