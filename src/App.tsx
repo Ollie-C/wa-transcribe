@@ -45,14 +45,18 @@ type TranslatorRunner = (text: string) => Promise<string>
 
 type TranslationTarget = 'ja'
 type SavedView = 'raw' | 'corrected' | 'ja'
+type WorkflowStage = 'transcribe' | 'refine' | 'translate'
 
 const STORAGE_KEY = 'wa-transcript:records:v2'
 const LEGACY_STORAGE_KEY = 'wa-transcript:records:v1'
 const AUDIO_DB_NAME = 'wa-transcript-audio'
 const AUDIO_STORE_NAME = 'audio-files'
-const CLEANUP_MODEL_ID = 'Xenova/flan-t5-base'
+/** Prefer large when HF serves it; `flan-t5-large` often returns 401 without a token — then we load base. */
+const CLEANUP_MODEL_CANDIDATES = ['Xenova/flan-t5-large', 'Xenova/flan-t5-base'] as const
 const TRANSLATION_MODEL_ID = 'Xenova/opus-mt-en-jap'
-const TRANSLATION_FALLBACK_MODEL_ID = 'Xenova/t5-small'
+const TRANSLATION_FALLBACK_MODEL_ID = 'Xenova/m2m100_418M'
+/** Max transcript characters per chunk (T5 encoder limit ~512 tokens; prompt + chunk must fit). */
+const REFINE_CHUNK_MAX_CHARS = 380
 
 const MODEL_OPTIONS: Array<{ id: string; label: string }> = [
   { id: 'Xenova/whisper-tiny.en', label: 'Whisper Tiny (English)' },
@@ -86,6 +90,10 @@ function formatFileSize(bytes: number) {
   if (!Number.isFinite(bytes) || bytes <= 0) return ''
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function shortModelName(modelId: string) {
+  return modelId.split('/').pop() ?? modelId
 }
 
 function pickMediaRecorderMimeType() {
@@ -173,22 +181,45 @@ function getTextFromOutput(output: unknown, key: string) {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-function cleanupPrompt(rawTranscript: string, contextNotes: string, stronger = false) {
+function cleanupPrompt(
+  rawTranscript: string,
+  contextNotes: string,
+  canonicalEntities: string[],
+  stronger = false,
+) {
   const context = contextNotes.trim() || '(none provided)'
+  const canonicalBlock =
+    canonicalEntities.length > 0
+      ? [
+          'Canonical names and terms (use these exact spellings when the audio clearly refers to them):',
+          ...canonicalEntities.map((e) => `- ${e}`),
+          '',
+        ].join('\n')
+      : ''
+
+  const fewShot = [
+    'Example:',
+    'Full context notes: The artist is Gomi Kenji.',
+    'Rough: I love Konna Gemji\'s art.',
+    'Corrected: I love Gomi Kenji\'s art.',
+    '',
+  ].join('\n')
+
   const extra = stronger
     ? [
         '- Rewrite rough phrasing into more natural English where possible.',
-        '- If a phrase in the transcript sounds like a context name or term, replace it with the context spelling.',
-        '- Example: if the transcript says "she low" and the context indicates "Shiro", output "Shiro".',
+        '- If a phrase in the transcript sounds like a canonical name or term above, use that exact spelling.',
+        '- If the transcript sounds like a context name or term, replace it with the correct spelling from the notes.',
       ]
     : []
 
   return [
     'Rewrite this rough English speech-to-text transcript into more natural, readable English.',
+    fewShot,
     'Rules:',
     '- Keep the transcript in English.',
     '- Preserve the original meaning.',
-    '- Use the context notes to correct likely names, artists, terms, and obvious ASR mistakes.',
+    '- Use the full context notes and canonical list to correct likely names, artists, terms, and obvious ASR mistakes.',
     '- Make the wording sound more natural while keeping uncertainty when the meaning is unclear.',
     ...extra,
     '- Do not add facts that are not present in the transcript or context notes.',
@@ -196,14 +227,11 @@ function cleanupPrompt(rawTranscript: string, contextNotes: string, stronger = f
     '- Lightly improve capitalization and punctuation.',
     '- Return only the rewritten transcript.',
     '',
-    `Context notes:\n${context}`,
+    canonicalBlock,
+    `Full context notes:\n${context}`,
     '',
     `Transcript:\n${rawTranscript.trim()}`,
   ].join('\n')
-}
-
-function translationPrompt(text: string) {
-  return `translate English to Japanese: ${text.trim()}`
 }
 
 function normalizeCleanupText(text: string) {
@@ -246,55 +274,178 @@ function levenshtein(a: string, b: string) {
   return dp[a.length][b.length]
 }
 
-function extractContextTerms(contextNotes: string) {
-  const matches = contextNotes.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b/g) ?? []
-  const ignored = new Set(['The', 'This', 'That', 'Tokyo'])
-  return Array.from(
-    new Set(matches.filter((term) => !ignored.has(term)).map((term) => term.trim())),
-  )
+/** Structured + heuristic extraction of names/terms from user context (longest-first for glossary). */
+function extractCanonicalEntities(contextNotes: string): string[] {
+  const raw = contextNotes.trim()
+  if (!raw) return []
+
+  const seen = new Set<string>()
+  const out: string[] = []
+
+  const add = (s: string) => {
+    const t = s.trim().replace(/\s+/g, ' ')
+    if (t.length < 2) return
+    const key = t.toLowerCase()
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push(t)
+  }
+
+  const labelRe =
+    /^(?:name|names|artist|artists|title|character|characters|term|terms|note|notes|context|people|person|band|album|series|work|works)\s*[:=-]\s*(.+)$/i
+  for (const line of raw.split(/\r?\n/)) {
+    const m = line.match(labelRe)
+    if (m?.[1]) add(m[1].replace(/^["']|["']$/g, '').trim())
+  }
+
+  const qre = /"([^"]+)"|'([^']+)'/g
+  let qm: RegExpExecArray | null
+  while ((qm = qre.exec(raw)) !== null) {
+    const inner = qm[1] ?? qm[2]
+    if (inner) add(inner)
+  }
+
+  const cueRe =
+    /\b(?:name is|(?:called|known as))\s+([A-Za-z0-9][^.\n!?]{0,160})/gi
+  let cm: RegExpExecArray | null
+  while ((cm = cueRe.exec(raw)) !== null) {
+    const fragment = cm[1].trim()
+    for (const piece of fragment.split(/,|\band\b/i)) {
+      const p = piece.replace(/^(the|a|an)\s+/i, '').trim()
+      if (p) add(p)
+    }
+  }
+
+  const titleMatch = raw.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b/g) ?? []
+  const ignored = new Set(['The', 'This', 'That', 'Tokyo', 'There', 'They'])
+  for (const t of titleMatch) {
+    if (!ignored.has(t)) add(t)
+  }
+
+  return out.sort((a, b) => b.length - a.length)
+}
+
+function maxRatioForPhraseLength(len: number) {
+  if (len <= 4) return 0.34
+  if (len <= 8) return 0.42
+  return 0.48
+}
+
+function replaceTokenPreservingEdges(token: string, replacementCore: string) {
+  const leading = token.match(/^[^A-Za-z0-9]*/) ?? ['']
+  const trailing = token.match(/[^A-Za-z0-9]*$/) ?? ['']
+  return `${leading[0]}${replacementCore}${trailing[0]}`
 }
 
 function applyContextGlossary(text: string, contextNotes: string) {
-  const terms = extractContextTerms(contextNotes)
+  const terms = extractCanonicalEntities(contextNotes)
   if (!terms.length) return text
 
   let tokens = text.split(/\s+/)
 
   for (const term of terms) {
-    const termWords = term.split(/\s+/)
+    const termWords = term.split(/\s+/).filter(Boolean)
     const termNormalized = normalizeFuzzyText(term)
     if (!termNormalized) continue
 
-    for (let i = 0; i <= tokens.length - termWords.length; i += 1) {
-      const window = tokens.slice(i, i + termWords.length)
-      const leading = window[0].match(/^[^A-Za-z]*/) ?? ['']
-      const trailing = window[window.length - 1].match(/[^A-Za-z]*$/) ?? ['']
-      const joined = window
-        .map((token) => token.replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, ''))
-        .join(' ')
-        .trim()
+    const n = termWords.length
+    const ratioLimit = maxRatioForPhraseLength(termNormalized.length)
 
-      if (!joined) continue
+    phrase: for (let win = n; win <= Math.min(n + 1, tokens.length); win += 1) {
+      for (let i = 0; i <= tokens.length - win; i += 1) {
+        const window = tokens.slice(i, i + win)
+        const leading = window[0].match(/^[^A-Za-z0-9]*/) ?? ['']
+        const trailing = window[window.length - 1].match(/[^A-Za-z0-9]*$/) ?? ['']
+        const joined = window
+          .map((token) => token.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, ''))
+          .join(' ')
+          .trim()
 
-      const windowNormalized = normalizeFuzzyText(joined)
-      if (!windowNormalized) continue
+        if (!joined) continue
 
-      const distance = levenshtein(windowNormalized, termNormalized)
-      const ratio = distance / Math.max(windowNormalized.length, termNormalized.length)
+        const windowNormalized = normalizeFuzzyText(joined)
+        if (!windowNormalized) continue
 
-      if (ratio <= 0.45) {
-        const replacement = `${leading[0]}${term}${trailing[0]}`
-        tokens = [
-          ...tokens.slice(0, i),
-          replacement,
-          ...tokens.slice(i + termWords.length),
-        ]
-        break
+        const distance = levenshtein(windowNormalized, termNormalized)
+        const ratio = distance / Math.max(windowNormalized.length, termNormalized.length)
+
+        if (ratio <= ratioLimit) {
+          const replacement = `${leading[0]}${term}${trailing[0]}`
+          tokens = [...tokens.slice(0, i), replacement, ...tokens.slice(i + win)]
+          break phrase
+        }
+      }
+    }
+
+    if (termWords.length >= 2) {
+      for (const tw of termWords) {
+        const tn = normalizeFuzzyText(tw)
+        if (tn.length < 3) continue
+        const wordLimit = maxRatioForPhraseLength(tn.length)
+
+        for (let i = 0; i < tokens.length; i += 1) {
+          const core = tokens[i].replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '')
+          if (!core) continue
+          const wn = normalizeFuzzyText(core)
+          if (!wn) continue
+          if (Math.abs(wn.length - tn.length) > 3) continue
+
+          const d = levenshtein(wn, tn)
+          const r = d / Math.max(wn.length, tn.length)
+          if (r <= wordLimit) {
+            tokens[i] = replaceTokenPreservingEdges(tokens[i], tw)
+          }
+        }
       }
     }
   }
 
   return tokens.join(' ')
+}
+
+function splitIntoSentences(text: string): string[] {
+  const t = text.trim()
+  if (!t) return []
+
+  let parts = t
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+
+  if (parts.length === 0) parts = [t]
+
+  const out: string[] = []
+  for (const p of parts) {
+    if (p.length <= REFINE_CHUNK_MAX_CHARS) {
+      out.push(p)
+    } else {
+      for (let i = 0; i < p.length; i += REFINE_CHUNK_MAX_CHARS) {
+        const slice = p.slice(i, i + REFINE_CHUNK_MAX_CHARS).trim()
+        if (slice) out.push(slice)
+      }
+    }
+  }
+  return out.filter(Boolean)
+}
+
+function packSentencesIntoChunks(sentences: string[], maxChars: number): string[][] {
+  if (!sentences.length) return []
+  const chunks: string[][] = []
+  let current: string[] = []
+  let size = 0
+
+  for (const s of sentences) {
+    const addLen = s.length + (current.length ? 1 : 0)
+    if (size + addLen > maxChars && current.length) {
+      chunks.push(current)
+      current = []
+      size = 0
+    }
+    current.push(s)
+    size += addLen
+  }
+  if (current.length) chunks.push(current)
+  return chunks
 }
 
 function basicReadabilityPass(text: string) {
@@ -431,6 +582,7 @@ export default function App() {
   const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null)
   const [selectedSavedView, setSelectedSavedView] = useState<SavedView>('raw')
   const [currentDraftRecordId, setCurrentDraftRecordId] = useState<string | null>(null)
+  const [expandedStage, setExpandedStage] = useState<WorkflowStage>('transcribe')
 
   const selectedRecord = useMemo(() => {
     if (!selectedRecordId) return null
@@ -574,16 +726,28 @@ export default function App() {
   async function getCleanupModel() {
     if (!cleanupCacheRef.current) {
       cleanupCacheRef.current = (async () => {
-        setStatus('Loading cleanup model...')
-        try {
-          const pipeline = await getPipelineLoader()
-          const cleaner = await pipeline('text2text-generation', CLEANUP_MODEL_ID)
-          setStatus('')
-          return cleaner as unknown as TextGeneratorFn
-        } catch (err) {
-          cleanupCacheRef.current = null
-          throw err
+        const pipeline = await getPipelineLoader()
+        let lastErr: unknown
+        for (const modelId of CLEANUP_MODEL_CANDIDATES) {
+          try {
+            setStatus(`Loading cleanup model…`)
+            const cleaner = await pipeline('text2text-generation', modelId)
+            setStatus('')
+            if (modelId !== CLEANUP_MODEL_CANDIDATES[0]) {
+              console.warn(
+                'Refinement model: using',
+                modelId,
+                '(large model unavailable — often needs Hugging Face auth or is gated).',
+              )
+            }
+            return cleaner as unknown as TextGeneratorFn
+          } catch (err) {
+            lastErr = err
+            console.warn(`Cleanup model load failed (${modelId}):`, err)
+          }
         }
+        cleanupCacheRef.current = null
+        throw lastErr
       })()
     }
     return cleanupCacheRef.current
@@ -609,18 +773,21 @@ export default function App() {
             console.warn('Primary translation model failed, using fallback:', primaryErr)
           }
 
-          const fallback = await pipeline(
-            'text2text-generation',
-            TRANSLATION_FALLBACK_MODEL_ID,
-          )
+          const fallback = await pipeline('translation', TRANSLATION_FALLBACK_MODEL_ID)
           setStatus('')
           return async (text: string) =>
             normalizeTranslationText(
               getTextFromOutput(
-                await (fallback as unknown as TextGeneratorFn)(translationPrompt(text), {
-                  max_new_tokens: maxTokensForText(text, 512),
+                await (
+                  fallback as unknown as (
+                    input: string,
+                    options?: { src_lang?: string; tgt_lang?: string },
+                  ) => Promise<unknown>
+                )(text, {
+                  src_lang: 'en',
+                  tgt_lang: 'ja',
                 }),
-                'generated_text',
+                'translation_text',
               ),
             )
         } catch (err) {
@@ -715,8 +882,10 @@ export default function App() {
         getTextFromOutput(out, 'text') ||
         getTextFromOutput(out, 'generated_text')
 
-      setRawTranscript(text.trim())
-      setStatus('Raw transcript complete.')
+      const finalText = text.trim()
+      setRawTranscript(finalText)
+      upsertCurrentRecord({ rawTranscript: finalText })
+      setStatus('Raw transcript complete. Saved.')
       success = true
     } catch (err: unknown) {
       const maybe = err as Record<string, unknown>
@@ -745,26 +914,36 @@ export default function App() {
 
     try {
       const cleaner = await getCleanupModel()
+      const entities = extractCanonicalEntities(contextNotes)
       const glossaryAdjusted = applyContextGlossary(source, contextNotes)
       const heuristicBase = basicReadabilityPass(glossaryAdjusted)
-      let cleaned = normalizeCleanupText(
-        getTextFromOutput(
-          await cleaner(cleanupPrompt(heuristicBase, contextNotes), {
-            max_new_tokens: maxTokensForText(heuristicBase, 384),
-          }),
-          'generated_text',
-        ),
-      )
+
+      const sentences = splitIntoSentences(heuristicBase)
+      const chunks = packSentencesIntoChunks(sentences, REFINE_CHUNK_MAX_CHARS)
+      const chunkGroups = chunks.length ? chunks : [[heuristicBase]]
+
+      async function runRefinePass(stronger: boolean) {
+        const parts: string[] = []
+        for (const chunk of chunkGroups) {
+          const chunkText = chunk.join(' ')
+          const prompt = cleanupPrompt(chunkText, contextNotes, entities, stronger)
+          const out = normalizeCleanupText(
+            getTextFromOutput(
+              await cleaner(prompt, {
+                max_new_tokens: maxTokensForText(chunkText, 512),
+              }),
+              'generated_text',
+            ),
+          )
+          parts.push(out.trim() ? out : chunkText)
+        }
+        return basicReadabilityPass(parts.join(' '))
+      }
+
+      let cleaned = await runRefinePass(false)
 
       if ((!cleaned || cleaned === heuristicBase) && contextNotes.trim()) {
-        cleaned = normalizeCleanupText(
-          getTextFromOutput(
-            await cleaner(cleanupPrompt(heuristicBase, contextNotes, true), {
-              max_new_tokens: maxTokensForText(heuristicBase, 384),
-            }),
-            'generated_text',
-          ),
-        )
+        cleaned = await runRefinePass(true)
       }
 
       const finalCleaned = basicReadabilityPass(
@@ -807,7 +986,18 @@ export default function App() {
 
     try {
       const translator = await getTranslatorModel()
-      const translated = await translator(source)
+      const sentences = splitIntoSentences(source)
+      const toTranslate = sentences.length ? sentences : [source]
+      const parts: string[] = []
+
+      for (const sentence of toTranslate) {
+        const s = sentence.trim()
+        if (!s) continue
+        const piece = await translator(s)
+        if (piece.trim()) parts.push(piece.trim())
+      }
+
+      const translated = parts.join('\n')
 
       if (!translated) {
         throw new Error('Translation model returned an empty result.')
@@ -935,11 +1125,12 @@ export default function App() {
   }
 
   function upsertCurrentRecord(partial: {
+    rawTranscript?: string | undefined
     correctedTranscript?: string | undefined
     translatedJa?: string | undefined
     contextNotes?: string | undefined
   }) {
-    const raw = rawTranscript.trim()
+    const raw = (partial.rawTranscript ?? rawTranscript).trim()
     if (!raw || !audioUrl) return
 
     const nextId = currentDraftRecordId ?? safeUUID()
@@ -977,11 +1168,6 @@ export default function App() {
     setSelectedSavedView(
       partial.translatedJa ? 'ja' : partial.correctedTranscript ? 'corrected' : 'raw',
     )
-  }
-
-  function saveTranscription() {
-    upsertCurrentRecord({})
-    setTimedStatus('Saved transcription record.')
   }
 
   function saveRefinement() {
@@ -1039,19 +1225,22 @@ export default function App() {
       <header className="wa-header">
         <div>
           <div className="wa-title">WhatsApp Voice Transcriber</div>
-          <div className="wa-subtitle">
-            Build transcripts locally, then optionally refine with context and translate.
-          </div>
+          <div className="wa-subtitle">Transcribe, refine, translate.</div>
         </div>
         <div className="wa-pill">
-          Whisper: <span className="wa-pillStrong">{selectedModel}</span>
+          STT <span className="wa-pillStrong">{shortModelName(selectedModel)}</span> · Refine{' '}
+          <span className="wa-pillStrong">flan-t5</span> · Translate{' '}
+          <span className="wa-pillStrong">opus-mt / m2m100</span>
         </div>
       </header>
 
       <main className="wa-grid">
         <section className="wa-card">
           <div className="wa-cardTitleRow">
-            <div className="wa-cardTitle">1) Current and previous audio files</div>
+            <div>
+              <div className="wa-sectionKicker">01 Audio</div>
+              <div className="wa-cardTitle">Source</div>
+            </div>
             <div className="wa-seg">
               <button
                 type="button"
@@ -1090,7 +1279,7 @@ export default function App() {
                   if (file) void onUploadFile(file)
                 }}
               >
-                <div className="wa-dropTitle">Drop an audio file here</div>
+                <div className="wa-dropTitle">Drop audio</div>
                 <div className="wa-dropHint">or click to choose</div>
                 <input
                   type="file"
@@ -1101,9 +1290,7 @@ export default function App() {
                   }}
                 />
               </label>
-              <div className="wa-muted">
-                Uploaded audio is kept in your browser storage until the site data is cleared.
-              </div>
+              <div className="wa-muted">Saved locally in this browser.</div>
             </div>
           ) : (
             <div className="wa-stack">
@@ -1139,17 +1326,15 @@ export default function App() {
                   Cancel
                 </button>
               </div>
-              <div className="wa-muted">
-                Recorded audio is also kept in your browser storage for later reuse.
-              </div>
+              <div className="wa-muted">Saved locally in this browser.</div>
             </div>
           )}
 
           <div className="wa-audioPanel">
             <div className="wa-subCard">
-              <div className="wa-subCardTitle">Current audio file</div>
+              <div className="wa-subCardTitle">Current</div>
               {!audioUrl ? (
-                <div className="wa-empty">No audio selected yet.</div>
+                <div className="wa-empty">No audio selected.</div>
               ) : (
                 <>
                   <div className="wa-audioMeta">
@@ -1169,11 +1354,9 @@ export default function App() {
             </div>
 
             <div className="wa-subCard">
-              <div className="wa-subCardTitle">Previous audio files</div>
+              <div className="wa-subCardTitle">Library</div>
               {previousAudioLibrary.length === 0 ? (
-                <div className="wa-emptySmall">
-                  Previous audio files will show up here after you upload or record them.
-                </div>
+                <div className="wa-emptySmall">Previous audio appears here.</div>
               ) : (
                 <div className="wa-historyList">
                   {previousAudioLibrary.map((item) => (
@@ -1208,196 +1391,241 @@ export default function App() {
 
           <section className="wa-card">
             <div className="wa-cardTitleRow">
-              <div className="wa-cardTitle">2a) Transcribe</div>
-            </div>
-
-            <div className="wa-stack">
-              <div className="wa-row">
-                <label className="wa-field">
-                  <div className="wa-label">Whisper model</div>
-                  <select
-                    className="wa-select"
-                    value={selectedModel}
-                    onChange={(e) => setSelectedModel(e.target.value)}
-                    disabled={isBusy}
-                  >
-                    {MODEL_OPTIONS.map((o) => (
-                      <option key={o.id} value={o.id}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="wa-field">
-                  <div className="wa-label">Language hint (optional)</div>
-                  <input
-                    className="wa-input"
-                    value={languageHint}
-                    onChange={(e) => setLanguageHint(e.target.value)}
-                    placeholder="e.g. en, english"
-                    disabled={isBusy}
-                  />
-                </label>
+              <div>
+                <div className="wa-sectionKicker">02 Workflow</div>
+                <div className="wa-cardTitle">Stages</div>
               </div>
-
-              <div className="wa-row">
-                <button
-                  type="button"
-                  className="wa-primary"
-                  onClick={() => void transcribeCurrentAudio()}
-                  disabled={!audioUrl || isBusy}
-                >
-                  {isTranscribing ? 'Transcribing...' : 'Transcribe'}
-                </button>
-                <button
-                  type="button"
-                  className="wa-ghost"
-                  onClick={saveTranscription}
-                  disabled={!rawTranscript.trim() || !audioUrl || isBusy}
-                >
-                  Save transcription
-                </button>
-                <button
-                  type="button"
-                  className="wa-ghost"
-                  onClick={() => void copyText(rawTranscript, 'transcription')}
-                  disabled={!rawTranscript.trim()}
-                >
-                  Copy
-                </button>
-              </div>
-
-              <label className="wa-textareaLabel">
-                <div className="wa-label">Transcribed version</div>
-                <textarea
-                  className="wa-textarea wa-textareaSection"
-                  value={rawTranscript}
-                  readOnly
-                  placeholder='Click "Transcribe" to generate the raw English transcript...'
-                />
-              </label>
-            </div>
-          </section>
-
-          <section className="wa-card">
-            <div className="wa-cardTitleRow">
-              <div className="wa-cardTitle">2b) Context refinement</div>
-              <div className="wa-muted">Optional</div>
             </div>
 
-            <div className="wa-stack">
-              <label className="wa-textareaLabel">
-                <div className="wa-label">Context</div>
-                <textarea
-                  className="wa-textarea wa-textareaContext"
-                  value={contextNotes}
-                  onChange={(e) => setContextNotes(e.target.value)}
-                  placeholder="Add names, artists, terms, spellings, or any details that should guide the cleanup."
-                  disabled={isBusy}
-                />
-              </label>
-
-              <div className="wa-row">
+            <div className="wa-stageGrid">
+              <section
+                className={
+                  expandedStage === 'transcribe' ? 'wa-stageCard wa-stageCardOpen' : 'wa-stageCard'
+                }
+              >
                 <button
                   type="button"
-                  className="wa-primary"
-                  onClick={() => void refineTranscript()}
-                  disabled={!rawTranscript.trim() || isBusy}
+                  className="wa-stageHeader"
+                  onClick={() => setExpandedStage('transcribe')}
                 >
-                  {isRefining ? 'Refining...' : 'Refine'}
+                  <span className="wa-stageIndex">01</span>
+                  <span className="wa-stageHeaderMain">
+                    <span className="wa-stageTitle">Transcribe</span>
+                  </span>
                 </button>
+
+                {expandedStage === 'transcribe' ? (
+                  <div className="wa-stageBody">
+                    <div className="wa-row">
+                      <label className="wa-field">
+                        <div className="wa-label">Model</div>
+                        <select
+                          className="wa-select"
+                          value={selectedModel}
+                          onChange={(e) => setSelectedModel(e.target.value)}
+                          disabled={isBusy}
+                        >
+                          {MODEL_OPTIONS.map((o) => (
+                            <option key={o.id} value={o.id}>
+                              {o.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="wa-field">
+                        <div className="wa-label">Hint</div>
+                        <input
+                          className="wa-input"
+                          value={languageHint}
+                          onChange={(e) => setLanguageHint(e.target.value)}
+                          placeholder="en"
+                          disabled={isBusy}
+                        />
+                      </label>
+                    </div>
+
+                    <div className="wa-row">
+                      <button
+                        type="button"
+                        className="wa-primary"
+                        onClick={() => void transcribeCurrentAudio()}
+                        disabled={!audioUrl || isBusy}
+                      >
+                        {isTranscribing ? 'Transcribing...' : 'Transcribe'}
+                      </button>
+                      <button
+                        type="button"
+                        className="wa-ghost"
+                        onClick={() => void copyText(rawTranscript, 'transcription')}
+                        disabled={!rawTranscript.trim()}
+                      >
+                        Copy
+                      </button>
+                    </div>
+
+                    <label className="wa-textareaLabel">
+                      <div className="wa-label">Output</div>
+                      <textarea
+                        className="wa-textarea wa-textareaSection"
+                        value={rawTranscript}
+                        readOnly
+                        placeholder="Raw transcript"
+                      />
+                    </label>
+                  </div>
+                ) : null}
+              </section>
+
+              <section
+                className={
+                  expandedStage === 'refine' ? 'wa-stageCard wa-stageCardOpen' : 'wa-stageCard'
+                }
+              >
                 <button
                   type="button"
-                  className="wa-ghost"
-                  onClick={saveRefinement}
-                  disabled={!correctedTranscript.trim() || !audioUrl || isBusy}
+                  className="wa-stageHeader"
+                  onClick={() => setExpandedStage('refine')}
                 >
-                  Save refined text
+                  <span className="wa-stageIndex">02</span>
+                  <span className="wa-stageHeaderMain">
+                    <span className="wa-stageTitle">Refine</span>
+                  </span>
                 </button>
+
+                {expandedStage === 'refine' ? (
+                  <div className="wa-stageBody">
+                    <label className="wa-textareaLabel">
+                      <div className="wa-label">Context</div>
+                      <textarea
+                        className="wa-textarea wa-textareaContext"
+                        value={contextNotes}
+                        onChange={(e) => setContextNotes(e.target.value)}
+                        placeholder="Names, spellings, terms"
+                        disabled={isBusy}
+                      />
+                    </label>
+
+                    <div className="wa-row">
+                      <button
+                        type="button"
+                        className="wa-primary"
+                        onClick={() => void refineTranscript()}
+                        disabled={!rawTranscript.trim() || isBusy}
+                      >
+                        {isRefining ? 'Refining...' : 'Refine'}
+                      </button>
+                      <button
+                        type="button"
+                        className="wa-primary wa-primaryAlt"
+                        onClick={saveRefinement}
+                        disabled={!correctedTranscript.trim() || !audioUrl || isBusy}
+                      >
+                        Save
+                      </button>
+                      <button
+                        type="button"
+                        className="wa-ghost"
+                        onClick={() => void copyText(correctedTranscript, 'refined text')}
+                        disabled={!correctedTranscript.trim()}
+                      >
+                        Copy
+                      </button>
+                    </div>
+
+                    <label className="wa-textareaLabel">
+                      <div className="wa-label">Output</div>
+                      <textarea
+                        className="wa-textarea wa-textareaSection"
+                        value={correctedTranscript}
+                        readOnly
+                        placeholder="Clean English"
+                      />
+                    </label>
+                  </div>
+                ) : null}
+              </section>
+
+              <section
+                className={
+                  expandedStage === 'translate'
+                    ? 'wa-stageCard wa-stageCardOpen'
+                    : 'wa-stageCard'
+                }
+              >
                 <button
                   type="button"
-                  className="wa-ghost"
-                  onClick={() => void copyText(correctedTranscript, 'refined text')}
-                  disabled={!correctedTranscript.trim()}
+                  className="wa-stageHeader"
+                  onClick={() => setExpandedStage('translate')}
                 >
-                  Copy
+                  <span className="wa-stageIndex">03</span>
+                  <span className="wa-stageHeaderMain">
+                    <span className="wa-stageTitle">Translate</span>
+                  </span>
                 </button>
-              </div>
 
-              <label className="wa-textareaLabel">
-                <div className="wa-label">Refined version</div>
-                <textarea
-                  className="wa-textarea wa-textareaSection"
-                  value={correctedTranscript}
-                  readOnly
-                  placeholder='Click "Refine" after adding optional context to produce a cleaned-up English version...'
-                />
-              </label>
-            </div>
-          </section>
+                {expandedStage === 'translate' ? (
+                  <div className="wa-stageBody">
+                    <label className="wa-field">
+                      <div className="wa-label">Target</div>
+                      <select
+                        className="wa-select"
+                        value={translationTarget}
+                        onChange={(e) => setTranslationTarget(e.target.value as TranslationTarget)}
+                        disabled={isBusy}
+                      >
+                        <option value="ja">Japanese</option>
+                      </select>
+                    </label>
 
-          <section className="wa-card">
-            <div className="wa-cardTitleRow">
-              <div className="wa-cardTitle">2c) Translation</div>
-              <div className="wa-muted">Optional</div>
-            </div>
+                    <div className="wa-row">
+                      <button
+                        type="button"
+                        className="wa-primary"
+                        onClick={() => void translateTranscript()}
+                        disabled={!correctedTranscript.trim() || isBusy}
+                      >
+                        {isTranslating ? 'Translating...' : 'Translate'}
+                      </button>
+                      <button
+                        type="button"
+                        className="wa-primary wa-primaryAlt"
+                        onClick={saveTranslation}
+                        disabled={!translatedJa.trim() || !audioUrl || isBusy}
+                      >
+                        Save
+                      </button>
+                      <button
+                        type="button"
+                        className="wa-ghost"
+                        onClick={() => void copyText(translatedJa, 'translation')}
+                        disabled={!translatedJa.trim()}
+                      >
+                        Copy
+                      </button>
+                    </div>
 
-            <div className="wa-stack">
-              <label className="wa-field">
-                <div className="wa-label">Language</div>
-                <select
-                  className="wa-select"
-                  value={translationTarget}
-                  onChange={(e) => setTranslationTarget(e.target.value as TranslationTarget)}
-                  disabled={isBusy}
-                >
-                  <option value="ja">Japanese</option>
-                </select>
-              </label>
-
-              <div className="wa-row">
-                <button
-                  type="button"
-                  className="wa-primary"
-                  onClick={() => void translateTranscript()}
-                  disabled={!correctedTranscript.trim() || isBusy}
-                >
-                  {isTranslating ? 'Translating...' : 'Translate'}
-                </button>
-                <button
-                  type="button"
-                  className="wa-ghost"
-                  onClick={saveTranslation}
-                  disabled={!translatedJa.trim() || !audioUrl || isBusy}
-                >
-                  Save translation
-                </button>
-                <button
-                  type="button"
-                  className="wa-ghost"
-                  onClick={() => void copyText(translatedJa, 'translation')}
-                  disabled={!translatedJa.trim()}
-                >
-                  Copy
-                </button>
-              </div>
-
-              <label className="wa-textareaLabel">
-                <div className="wa-label">Japanese translation</div>
-                <textarea
-                  className="wa-textarea wa-textareaSection"
-                  value={translatedJa}
-                  readOnly
-                  placeholder='Click "Translate" to generate the Japanese translation from the refined English text...'
-                />
-              </label>
+                    <label className="wa-textareaLabel">
+                      <div className="wa-label">Output</div>
+                      <textarea
+                        className="wa-textarea wa-textareaSection"
+                        value={translatedJa}
+                        readOnly
+                        placeholder="Japanese text"
+                      />
+                    </label>
+                  </div>
+                ) : null}
+              </section>
             </div>
           </section>
         </div>
 
         <section className="wa-card wa-cardWide">
           <div className="wa-cardTitleRow">
-            <div className="wa-cardTitle">3) Saved texts</div>
+            <div>
+              <div className="wa-sectionKicker">03 Saved</div>
+              <div className="wa-cardTitle">Records</div>
+            </div>
             <div className="wa-muted">
               {records.length ? `${records.length} records` : 'Nothing saved yet.'}
             </div>
@@ -1405,9 +1633,9 @@ export default function App() {
 
           <div className="wa-recordsLayout">
             <div className="wa-subCard">
-              <div className="wa-subCardTitle">3a) Records</div>
+              <div className="wa-subCardTitle">List</div>
               {records.length === 0 ? (
-                <div className="wa-emptySmall">Your saved text records will show up here.</div>
+                <div className="wa-emptySmall">Saved text appears here.</div>
               ) : (
                 <div className="wa-historyList">
                   {records.map((r) => (
@@ -1441,14 +1669,14 @@ export default function App() {
                       <div className="wa-historyMeta">
                         <span className="wa-tag">{formatDateTime(r.createdAt)}</span>
                         {r.durationSec ? <span className="wa-tag">{formatDuration(r.durationSec)}</span> : null}
-                        <span className="wa-tag">{r.model.split('/').pop()}</span>
+                        <span className="wa-tag">{shortModelName(r.model)}</span>
                         {r.correctedTranscript ? (
                           <button
                             type="button"
                             className="wa-tagBtn"
                             onClick={() => loadRecord(r, 'corrected')}
                           >
-                            context refinement
+                            refined
                           </button>
                         ) : null}
                         {r.translatedJa ? (
@@ -1468,11 +1696,9 @@ export default function App() {
             </div>
 
             <div className="wa-subCard">
-              <div className="wa-subCardTitle">3b) Record viewer</div>
+              <div className="wa-subCardTitle">Viewer</div>
               {!selectedRecord ? (
-                <div className="wa-emptySmall">
-                  Select a record to view its transcription, refinement, or translation.
-                </div>
+                <div className="wa-emptySmall">Select a record.</div>
               ) : (
                 <div className="wa-stack">
                   <div className="wa-row">
@@ -1503,14 +1729,16 @@ export default function App() {
                         Translation
                       </button>
                     ) : null}
-                  </div>
-
-                  <div className="wa-mutedSmall">
-                    {selectedSavedView === 'raw'
-                      ? 'Showing the saved transcription.'
-                      : selectedSavedView === 'corrected'
-                        ? 'Showing the saved context-refined version.'
-                        : 'Showing the saved Japanese translation.'}
+                    <button
+                      type="button"
+                      className="wa-copyIconBtn"
+                      onClick={() => void copyText(selectedSavedText, 'saved text')}
+                      disabled={!selectedSavedText.trim()}
+                      aria-label="Copy text"
+                      title="Copy text"
+                    >
+                      ⧉
+                    </button>
                   </div>
 
                   <textarea
@@ -1525,12 +1753,7 @@ export default function App() {
         </section>
       </main>
 
-      <footer className="wa-footer">
-        <div className="wa-muted">
-          Audio files, transcripts, refinement, and translation outputs stay local to this
-          browser.
-        </div>
-      </footer>
+      <footer className="wa-footer" />
     </div>
   )
 }

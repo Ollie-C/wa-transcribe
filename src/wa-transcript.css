@@ -1,9 +1,10 @@
 #wa-app {
   width: min(1100px, 100%);
   margin: 0 auto;
-  padding: 18px 14px 28px;
+  padding: 28px 18px 34px;
   text-align: left;
   box-sizing: border-box;
+  font-family: var(--sans);
 }
 
 .wa-header {
@@ -11,30 +12,33 @@
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 16px;
+  margin-bottom: 18px;
 }
 
 .wa-title {
+  font-family: var(--heading);
   font-size: 20px;
   font-weight: 650;
   color: var(--text-h);
-  letter-spacing: -0.2px;
+  letter-spacing: -0.03em;
 }
 
 .wa-subtitle {
   margin-top: 6px;
-  font-size: 14px;
+  font-size: 13px;
   color: var(--text);
 }
 
 .wa-pill {
   font-size: 12px;
   color: var(--text-h);
-  border: 1px solid var(--border);
-  background: var(--social-bg);
-  padding: 8px 10px;
+  border: 0;
   border-radius: 999px;
-  white-space: nowrap;
+  white-space: normal;
+  line-height: 1.45;
+  text-align: right;
+  display: flex;
+  flex-direction: column;
 }
 
 .wa-pillStrong {
@@ -44,7 +48,7 @@
 .wa-grid {
   display: grid;
   grid-template-columns: 1fr;
-  gap: 14px;
+  gap: 16px;
 }
 
 @media (min-width: 980px) {
@@ -61,11 +65,12 @@
 }
 
 .wa-card {
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 14px;
-  background: color-mix(in oklab, var(--bg) 92%, transparent);
+  border: 0;
+  border-radius: 18px;
+  padding: 18px;
+  background: color-mix(in oklab, var(--bg) 94%, white 6%);
   box-shadow: var(--shadow);
+  backdrop-filter: blur(6px);
 }
 
 .wa-cardWide {
@@ -83,12 +88,23 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-bottom: 10px;
+  margin-bottom: 14px;
 }
 
 .wa-cardTitle {
+  font-family: var(--heading);
   font-weight: 650;
   color: var(--text-h);
+  letter-spacing: -0.02em;
+  font-size: 22px;
+}
+
+.wa-sectionKicker {
+  margin-bottom: 4px;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
 }
 
 .wa-muted {
@@ -108,8 +124,8 @@
 
 .wa-seg {
   display: inline-flex;
-  background: var(--social-bg);
-  border: 1px solid var(--border);
+  background: color-mix(in oklab, var(--bg) 92%, white 8%);
+  border: 0;
   border-radius: 999px;
   padding: 3px;
   gap: 4px;
@@ -128,7 +144,7 @@
 .wa-segBtnActive {
   background: var(--accent-bg);
   color: var(--text-h);
-  border: 1px solid var(--accent-border);
+  border: 0;
 }
 
 .wa-stack {
@@ -160,9 +176,9 @@
 .wa-input,
 .wa-select {
   width: 100%;
-  border: 1px solid var(--border);
-  background: transparent;
-  border-radius: 10px;
+  border: 0;
+  background: color-mix(in oklab, var(--bg) 94%, white 6%);
+  border-radius: 12px;
   padding: 10px 12px;
   color: var(--text-h);
   outline: none;
@@ -173,25 +189,40 @@
 .wa-input:focus,
 .wa-select:focus {
   border-color: var(--accent-border);
-  box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent-bg) 70%, transparent);
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent-bg) 90%, transparent);
 }
 
 .wa-primary,
 .wa-danger,
 .wa-ghost,
 .wa-ghostSmall {
-  border-radius: 10px;
+  border-radius: 999px;
   padding: 10px 12px;
-  border: 1px solid var(--border);
-  background: transparent;
+  border: 0;
+  background: color-mix(in oklab, var(--bg) 94%, white 6%);
   color: var(--text-h);
   cursor: pointer;
   font-weight: 600;
+  transition:
+    border-color 120ms ease,
+    background 120ms ease,
+    transform 120ms ease;
 }
 
 .wa-primary {
   background: var(--accent-bg);
   border-color: var(--accent-border);
+  color: color-mix(in oklab, var(--text-h) 88%, var(--accent) 12%);
+}
+
+.wa-primaryAlt {
+  background: color-mix(in oklab, var(--accent-bg) 72%, var(--bg));
+}
+
+@media (prefers-color-scheme: dark) {
+  .wa-primary {
+    color: var(--text-h);
+  }
 }
 
 .wa-danger {
@@ -207,11 +238,25 @@
   padding: 8px 10px;
   font-weight: 600;
   font-size: 13px;
+  color: var(--text);
+  background: color-mix(in oklab, var(--bg) 90%, transparent);
+}
+
+.wa-primary:hover,
+.wa-danger:hover,
+.wa-ghost:hover,
+.wa-ghostSmall:hover,
+.wa-segBtn:hover,
+.wa-chip:hover,
+.wa-tagBtn:hover,
+.wa-historyDel:hover {
+  transform: translateY(-1px);
 }
 
 .wa-primary:disabled,
 .wa-danger:disabled,
-.wa-ghost:disabled {
+.wa-ghost:disabled,
+.wa-ghostSmall:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
@@ -219,25 +264,28 @@
 .wa-status {
   font-size: 13px;
   color: var(--text-h);
-  background: var(--accent-bg);
-  border: 1px solid var(--accent-border);
+  background: color-mix(in oklab, var(--accent-bg) 92%, var(--bg));
+  border: 0;
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: 14px;
 }
 
 .wa-drop {
-  border: 1px dashed var(--border);
-  border-radius: 14px;
-  padding: 14px;
-  background: color-mix(in oklab, var(--bg) 82%, transparent);
+  border: 0;
+  border-radius: 18px;
+  padding: 18px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--accent-bg) 46%, transparent),
+    color-mix(in oklab, var(--bg) 92%, white 8%)
+  );
   cursor: pointer;
   position: relative;
   overflow: hidden;
 }
 
 .wa-dropDrag {
-  border-color: var(--accent-border);
-  background: var(--accent-bg);
+  background: color-mix(in oklab, var(--accent-bg) 70%, var(--bg));
 }
 
 .wa-drop input[type='file'] {
@@ -269,21 +317,30 @@
 .wa-audioPanel {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  margin-top: 10px;
+  gap: 12px;
+  margin-top: 14px;
 }
 
 .wa-subCard {
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 12px;
-  background: color-mix(in oklab, var(--bg) 86%, transparent);
+  border: 0;
+  border-radius: 16px;
+  padding: 14px;
+  background: color-mix(in oklab, var(--bg) 92%, white 8%);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--border) 8%, transparent);
+}
+
+@media (prefers-color-scheme: dark) {
+  .wa-subCard {
+    box-shadow: none;
+  }
 }
 
 .wa-subCardTitle {
+  font-family: var(--heading);
   margin-bottom: 10px;
   font-weight: 650;
   color: var(--text-h);
+  letter-spacing: -0.02em;
 }
 
 .wa-recordsLayout {
@@ -331,9 +388,9 @@
   font-size: 12px;
   padding: 6px 10px;
   border-radius: 999px;
-  border: 1px solid var(--border);
+  border: 0;
   color: var(--text);
-  background: color-mix(in oklab, var(--bg) 70%, transparent);
+  background: color-mix(in oklab, var(--bg) 78%, white 22%);
 }
 
 .wa-audioEl {
@@ -349,15 +406,19 @@
 .wa-textarea {
   width: 100%;
   min-height: 220px;
-  border: 1px solid var(--border);
+  border: 0;
   border-radius: 14px;
   padding: 12px;
-  background: transparent;
+  background: color-mix(in oklab, var(--bg) 96%, white 4%);
   color: var(--text-h);
   outline: none;
   font-size: 14px;
   box-sizing: border-box;
   resize: vertical;
+}
+
+.wa-textarea:focus {
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent-bg) 90%, transparent);
 }
 
 .wa-textareaContext {
@@ -385,16 +446,16 @@
 }
 
 .wa-historyItem {
-  border: 1px solid var(--border);
+  border: 0;
   border-radius: 14px;
   padding: 10px;
   cursor: pointer;
-  background: color-mix(in oklab, var(--bg) 86%, transparent);
+  background: color-mix(in oklab, var(--bg) 92%, white 8%);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--border) 8%, transparent);
 }
 
 .wa-historyItemActive {
-  border-color: var(--accent-border);
-  box-shadow: 0 0 0 4px color-mix(in oklab, var(--accent-bg) 60%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent-bg) 90%, transparent);
 }
 
 .wa-historyTop {
@@ -423,8 +484,8 @@
 }
 
 .wa-historyDel {
-  border: 1px solid var(--border);
-  background: transparent;
+  border: 0;
+  background: color-mix(in oklab, var(--bg) 94%, white 6%);
   color: var(--text);
   border-radius: 10px;
   padding: 6px 10px;
@@ -448,9 +509,9 @@
   font-size: 12px;
   padding: 6px 10px;
   border-radius: 999px;
-  border: 1px solid var(--border);
+  border: 0;
   color: var(--text);
-  background: color-mix(in oklab, var(--bg) 70%, transparent);
+  background: color-mix(in oklab, var(--bg) 78%, white 22%);
   cursor: pointer;
 }
 
@@ -466,7 +527,125 @@
   background: var(--accent-bg);
 }
 
+.wa-stageGrid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+.wa-stageCard {
+  border: 0;
+  border-radius: 18px;
+  background: color-mix(in oklab, var(--bg) 92%, white 8%);
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--border) 8%, transparent);
+}
+
+.wa-stageCardOpen {
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent-bg) 90%, transparent);
+}
+
+.wa-stageHeader {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.wa-stageIndex {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in oklab, var(--accent-bg) 92%, var(--bg));
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.wa-stageHeaderMain {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.wa-stageTitle {
+  font-family: var(--heading);
+  font-size: 22px;
+  line-height: 1;
+  color: var(--text-h);
+}
+
+.wa-stageBody {
+  padding: 0 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.wa-copyIconBtn {
+  margin-left: auto;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--accent-bg) 72%, var(--bg));
+  color: var(--text-h);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  transition:
+    background 120ms ease,
+    transform 120ms ease,
+    opacity 120ms ease;
+}
+
+.wa-copyIconBtn:hover {
+  transform: translateY(-1px);
+}
+
+.wa-copyIconBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .wa-footer {
   margin-top: 18px;
   text-align: center;
+}
+
+@media (max-width: 720px) {
+  #wa-app {
+    padding: 18px 14px 28px;
+  }
+
+  .wa-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .wa-card {
+    padding: 16px;
+    border-radius: 16px;
+  }
+
+  .wa-cardTitle {
+    font-size: 20px;
+  }
+
+  .wa-stageTitle {
+    font-size: 20px;
+  }
 }
